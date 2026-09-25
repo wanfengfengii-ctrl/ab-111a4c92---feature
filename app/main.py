@@ -1,4 +1,4 @@
-"""FastAPI application exposing the versioned deconvolution endpoint."""
+"""FastAPI application exposing the versioned deconvolution endpoints."""
 
 from __future__ import annotations
 
@@ -10,13 +10,23 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .schemas import (
+    AdjudicationOut,
     ClusterOut,
     DeconvolutionRequest,
     DeconvolutionResponse,
     InputSummaryOut,
     ObjectivesOut,
     PeakOut,
+    SensitivityInputSummaryOut,
+    SensitivitySpectrumRequest,
+    SensitivitySpectrumResponse,
     SolutionOut,
+    SpectrumSegmentOut,
+)
+from .sensitivity import (
+    SensitivityScanner,
+    SensitivityScanError,
+    format_boundary,
 )
 from .solver import (
     ISOTOPE_SPACING,
@@ -38,7 +48,9 @@ app = FastAPI(
         "Deterministic, exhaustive deconvolution of overlapping isotope peak "
         "clusters for high-resolution mass spectrometry review. Objectives are "
         "optimised lexicographically: (1) maximise explained total intensity, "
-        "(2) maximise explained peak count, (3) minimise cluster count."
+        "(2) maximise explained peak count, (3) minimise cluster count. A "
+        "sensitivity endpoint reports exactly how the adjudication changes "
+        "across a closed tolerance range."
     ),
 )
 
@@ -98,6 +110,7 @@ def root() -> dict:
         "version": __version__,
         "endpoints": {
             "deconvolve": "POST /api/v1/deconvolve",
+            "sensitivity_spectrum": "POST /api/v1/sensitivity-spectrum",
             "health": "GET /health",
             "docs": "GET /docs",
         },
@@ -111,10 +124,7 @@ def root() -> dict:
     summary="Deterministically deconvolve overlapping isotope peaks",
 )
 def deconvolve(payload: DeconvolutionRequest) -> DeconvolutionResponse:
-    peaks = [
-        Peak(index=i, mz=p.mz, intensity=p.intensity)
-        for i, p in enumerate(payload.peaks)
-    ]
+    peaks = _peaks_of(payload)
     result = Deconvolver(
         peaks=peaks,
         charges=payload.charges,
@@ -124,16 +134,104 @@ def deconvolve(payload: DeconvolutionRequest) -> DeconvolutionResponse:
     return _build_response(payload, peaks, result)
 
 
+@app.post(
+    "/api/v1/sensitivity-spectrum",
+    response_model=SensitivitySpectrumResponse,
+    tags=["v1"],
+    summary="Exact sensitivity spectrum of the verdict over a tolerance range",
+)
+def sensitivity_spectrum(
+    payload: SensitivitySpectrumRequest,
+) -> SensitivitySpectrumResponse | JSONResponse:
+    """Scan a closed tolerance range for adjudication changes.
+
+    The scan derives every critical tolerance exactly from adjacent-peak
+    differences and the allowed charges, recomputes the global deconvolution
+    only at the range endpoints and those critical points, and merges
+    adjacent regions whose normalised adjudication is identical.
+    """
+    peaks = _peaks_of(payload)
+    scanner = SensitivityScanner(
+        peaks=peaks,
+        charges=payload.charges,
+        lower=payload.tolerance_range.lower,
+        upper=payload.tolerance_range.upper,
+        max_search_ops=MAX_SEARCH_OPS,
+    )
+    try:
+        spectrum = scanner.run()
+    except SensitivityScanError as exc:
+        # Budget exhausted mid-scan: report an explicit failure, never a
+        # partial spectrum with silently missing critical conclusions.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "SENSITIVITY_SCAN_EXCEEDED",
+                    "message": str(exc),
+                    "fields": [],
+                }
+            },
+        )
+    segments = [
+        SpectrumSegmentOut(
+            lower=format_boundary(segment.lower),
+            upper=format_boundary(segment.upper),
+            upper_inclusive=segment.upper_inclusive,
+            adjudication=_adjudication_out(segment.adjudication, peaks),
+        )
+        for segment in spectrum.segments
+    ]
+    return SensitivitySpectrumResponse(
+        segments=segments,
+        evaluation_point_count=len(spectrum.evaluation_points),
+        critical_point_count=len(spectrum.critical_points),
+        input_summary=SensitivityInputSummaryOut(
+            peak_count=len(peaks),
+            charges=sorted(set(payload.charges)),
+            tolerance_range={
+                "lower": str(payload.tolerance_range.lower),
+                "upper": str(payload.tolerance_range.upper),
+            },
+            isotope_spacing=str(ISOTOPE_SPACING),
+        ),
+    )
+
+
+def _peaks_of(payload: DeconvolutionRequest | SensitivitySpectrumRequest) -> list[Peak]:
+    return [
+        Peak(index=i, mz=p.mz, intensity=p.intensity)
+        for i, p in enumerate(payload.peaks)
+    ]
+
+
 def _build_response(
     payload: DeconvolutionRequest,
     peaks: list[Peak],
     result: DeconvolutionResult,
 ) -> DeconvolutionResponse:
+    adjudication = _adjudication_out(result, peaks)
+    return DeconvolutionResponse(
+        verdict=adjudication.verdict,
+        objectives=adjudication.objectives,
+        clusters=adjudication.clusters,
+        unexplained_peaks=adjudication.unexplained_peaks,
+        second_witness=adjudication.second_witness,
+        input_summary=InputSummaryOut(
+            peak_count=len(peaks),
+            charges=sorted(set(payload.charges)),
+            tolerance=str(payload.tolerance),
+            isotope_spacing=str(ISOTOPE_SPACING),
+        ),
+    )
+
+
+def _adjudication_out(result: DeconvolutionResult, peaks: list[Peak]) -> AdjudicationOut:
     primary = _solution_out(result.primary, peaks)
     secondary = (
         _solution_out(result.secondary, peaks) if result.secondary is not None else None
     )
-    return DeconvolutionResponse(
+    return AdjudicationOut(
         verdict=result.verdict,
         objectives=ObjectivesOut(
             explained_intensity=result.explained_intensity,
@@ -143,12 +241,6 @@ def _build_response(
         clusters=primary.clusters,
         unexplained_peaks=primary.unexplained_peaks,
         second_witness=secondary,
-        input_summary=InputSummaryOut(
-            peak_count=len(peaks),
-            charges=sorted(set(payload.charges)),
-            tolerance=str(payload.tolerance),
-            isotope_spacing=str(ISOTOPE_SPACING),
-        ),
     )
 
 

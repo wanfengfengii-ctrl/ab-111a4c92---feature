@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from fractions import Fraction
 from typing import Iterable, Sequence
 
 #: Exact isotope spacing (mass difference of 13C vs 12C) in Dalton.
@@ -96,7 +97,7 @@ class Deconvolver:
         self,
         peaks: Sequence[Peak],
         charges: Iterable[int],
-        tolerance: Decimal,
+        tolerance: Decimal | Fraction,
         max_search_ops: int = DEFAULT_MAX_SEARCH_OPS,
     ) -> None:
         peaks = tuple(peaks)
@@ -109,7 +110,11 @@ class Deconvolver:
             raise ValueError("tolerance must be non-negative")
         self._peaks = peaks
         self._charges = charges
-        self._tolerance = tolerance
+        # Tolerance is stored as an exact rational: Decimal inputs convert
+        # losslessly, and Fraction inputs (used by the sensitivity scanner so
+        # that non-terminating critical tolerances such as 0.1/3 stay exact)
+        # pass through unchanged.
+        self._tolerance = Fraction(tolerance)
         self._max_search_ops = max_search_ops
         self._search_ops = 0
         self._full_mask = (1 << len(peaks)) - 1
@@ -134,9 +139,12 @@ class Deconvolver:
 
         The spacing test is evaluated exactly: ``|Δmz·z − 1.003355| ≤ tol·z``
         is equivalent to ``|Δmz − 1.003355/z| ≤ tol`` but needs no division.
+        All operands are exact rationals, so a Fraction tolerance keeps the
+        comparison exact even when the tolerance has no finite decimal form.
         """
-        mzs = [p.mz for p in self._peaks]
+        mzs = [Fraction(p.mz) for p in self._peaks]
         intensities = [p.intensity for p in self._peaks]
+        spacing = Fraction(ISOTOPE_SPACING)
         n = len(mzs)
         clusters: list[Cluster] = []
         for charge in self._charges:
@@ -146,7 +154,7 @@ class Deconvolver:
             for i in range(n):
                 for j in range(i + 1, n):
                     delta = mzs[j] - mzs[i]
-                    deviation = delta * charge - ISOTOPE_SPACING
+                    deviation = delta * charge - spacing
                     if deviation > threshold:
                         break  # m/z strictly increasing: later j deviate even more
                     if deviation >= -threshold:
