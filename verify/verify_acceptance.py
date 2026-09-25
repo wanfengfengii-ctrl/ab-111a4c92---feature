@@ -24,6 +24,7 @@ import httpx
 BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 HEALTH_URL = f"{BASE_URL}/health"
 DECONVOLVE_URL = f"{BASE_URL}/api/v1/deconvolve"
+SENSITIVITY_URL = f"{BASE_URL}/api/v1/deconvolve/sensitivity"
 
 _checks = 0
 _failures: list[str] = []
@@ -54,6 +55,10 @@ def wait_for_api(timeout_s: float = 60.0) -> bool:
 
 def post(client: httpx.Client, payload: dict) -> httpx.Response:
     return client.post(DECONVOLVE_URL, json=payload, timeout=30.0)
+
+
+def post_sensitivity(client: httpx.Client, payload: dict) -> httpx.Response:
+    return client.post(SENSITIVITY_URL, json=payload, timeout=60.0)
 
 
 def cluster_index_sets(solution_clusters: list[dict]) -> set[tuple[int, ...]]:
@@ -394,6 +399,228 @@ def scenario_validation(client: httpx.Client) -> None:
 
 
 # ---------------------------------------------------------------------- #
+# Sensitivity spectrum scenarios
+# ---------------------------------------------------------------------- #
+
+
+def scenario_sensitivity_boundary_split(client: httpx.Client) -> dict:
+    print("[sensitivity: spectrum splits exactly at the critical tolerance]")
+    # Pair deviation is exactly 0.0005 at z=1, so the verdict must flip at
+    # the derived critical tolerance 0.0005 — not on any sampled grid.
+    payload = {
+        "peaks": [
+            {"mz": "400.000000", "intensity": 5},
+            {"mz": "401.003855", "intensity": 7},
+        ],
+        "charges": [1],
+        "tolerance_range": {"lower": "0.0001", "upper": "0.001"},
+    }
+    resp = post_sensitivity(client, payload)
+    check("spectrum: 200", resp.status_code == 200, f"got {resp.status_code}: {resp.text}")
+    body = resp.json()
+    segments = body.get("segments", [])
+    check(
+        "spectrum: critical tolerance derived exactly as 0.0005",
+        body.get("critical_tolerances") == ["0.0005"],
+        repr(body.get("critical_tolerances")),
+    )
+    check(
+        "spectrum: recomputed only at range endpoint + critical point",
+        body.get("evaluation_count") == 2,
+        repr(body.get("evaluation_count")),
+    )
+    check("spectrum: two segments", len(segments) == 2, repr(segments))
+    if len(segments) == 2:
+        lo_seg, hi_seg = segments
+        check(
+            "spectrum: [0.0001, 0.0005) is UNRESOLVED, upper excluded",
+            lo_seg.get("lower") == "0.0001"
+            and lo_seg.get("upper") == "0.0005"
+            and lo_seg.get("upper_inclusive") is False
+            and lo_seg.get("verdict") == "UNRESOLVED"
+            and lo_seg.get("clusters") == []
+            and [p["index"] for p in lo_seg.get("unexplained_peaks", [])] == [0, 1],
+            repr(lo_seg),
+        )
+        obj = hi_seg.get("objectives", {})
+        check(
+            "spectrum: [0.0005, 0.001] is UNIQUE (12/2/1), upper included",
+            hi_seg.get("lower") == "0.0005"
+            and hi_seg.get("upper") == "0.001"
+            and hi_seg.get("upper_inclusive") is True
+            and hi_seg.get("verdict") == "UNIQUE"
+            and (obj.get("explained_intensity"), obj.get("explained_peak_count"), obj.get("cluster_count"))
+            == (12, 2, 1)
+            and [c["peak_indices"] for c in hi_seg.get("clusters", [])] == [[0, 1]]
+            and hi_seg.get("second_witness") is None,
+            repr(hi_seg),
+        )
+        check(
+            "spectrum: segments contiguous and ascending",
+            lo_seg.get("upper") == hi_seg.get("lower"),
+            f"{lo_seg.get('upper')} != {hi_seg.get('lower')}",
+        )
+    # The plain deconvolution endpoint must agree on both sides.
+    at = post(client, {"peaks": payload["peaks"], "charges": [1], "tolerance": "0.0005"})
+    below = post(client, {"peaks": payload["peaks"], "charges": [1], "tolerance": "0.0004999"})
+    check(
+        "spectrum: deconvolve agrees at and below the critical tolerance",
+        at.status_code == 200
+        and at.json().get("verdict") == "UNIQUE"
+        and below.status_code == 200
+        and below.json().get("verdict") == "UNRESOLVED",
+        f"at={at.text} below={below.text}",
+    )
+    return payload
+
+
+def scenario_sensitivity_determinism(client: httpx.Client, payload: dict) -> None:
+    print("[sensitivity: determinism]")
+    bodies = {post_sensitivity(client, payload).text for _ in range(3)}
+    check("identical scan yields byte-identical spectra", len(bodies) == 1)
+
+
+def scenario_sensitivity_merges_unchanged_verdicts(client: httpx.Client) -> None:
+    print("[sensitivity: adjacent identical verdicts are merged]")
+    # Exact 3-chain: pair (0,2) becomes eligible at 1.003355 but {0,2} never
+    # beats the full chain, so the verdict is identical on both sides of the
+    # critical point and the two intervals must collapse into one.
+    payload = {
+        "peaks": [
+            {"mz": "500.000000", "intensity": 10},
+            {"mz": "501.003355", "intensity": 10},
+            {"mz": "502.006710", "intensity": 10},
+        ],
+        "charges": [1],
+        "tolerance_range": {"lower": "0", "upper": "2"},
+    }
+    resp = post_sensitivity(client, payload)
+    check("merge: 200", resp.status_code == 200, f"got {resp.status_code}: {resp.text}")
+    body = resp.json()
+    segments = body.get("segments", [])
+    check(
+        "merge: critical 1.003355 derived, two evaluations performed",
+        body.get("critical_tolerances") == ["1.003355"] and body.get("evaluation_count") == 2,
+        repr({k: body.get(k) for k in ("critical_tolerances", "evaluation_count")}),
+    )
+    check("merge: identical verdicts collapse to one segment", len(segments) == 1, repr(segments))
+    if segments:
+        seg = segments[0]
+        obj = seg.get("objectives", {})
+        check(
+            "merge: single segment [0, 2] UNIQUE (30/3/1), upper included",
+            seg.get("lower") == "0"
+            and seg.get("upper") == "2"
+            and seg.get("upper_inclusive") is True
+            and seg.get("verdict") == "UNIQUE"
+            and (obj.get("explained_intensity"), obj.get("explained_peak_count"), obj.get("cluster_count"))
+            == (30, 3, 1)
+            and [c["peak_indices"] for c in seg.get("clusters", [])] == [[0, 1, 2]],
+            repr(seg),
+        )
+
+
+def scenario_sensitivity_fractional_boundary(client: httpx.Client) -> None:
+    print("[sensitivity: non-terminating critical tolerance stays exact]")
+    # z=3: deviation is exactly 0.000001, so the critical tolerance is
+    # 1/3000000 = 0.000000333... — reported as an exact fraction string.
+    payload = {
+        "peaks": [
+            {"mz": "500.000000", "intensity": 10},
+            {"mz": "500.334452", "intensity": 20},
+        ],
+        "charges": [3],
+        "tolerance_range": {"lower": "0.0000001", "upper": "0.000001"},
+    }
+    resp = post_sensitivity(client, payload)
+    check("fraction: 200", resp.status_code == 200, f"got {resp.status_code}: {resp.text}")
+    body = resp.json()
+    segments = body.get("segments", [])
+    check(
+        "fraction: critical tolerance is exactly 1/3000000",
+        body.get("critical_tolerances") == ["1/3000000"],
+        repr(body.get("critical_tolerances")),
+    )
+    check("fraction: two segments", len(segments) == 2, repr(segments))
+    if len(segments) == 2:
+        lo_seg, hi_seg = segments
+        check(
+            "fraction: exact boundaries and inclusive flags",
+            lo_seg.get("lower") == "0.0000001"
+            and lo_seg.get("upper") == "1/3000000"
+            and lo_seg.get("upper_inclusive") is False
+            and lo_seg.get("verdict") == "UNRESOLVED"
+            and hi_seg.get("lower") == "1/3000000"
+            and hi_seg.get("upper") == "0.000001"
+            and hi_seg.get("upper_inclusive") is True
+            and hi_seg.get("verdict") == "UNIQUE"
+            and hi_seg.get("clusters", [{}])[0].get("charge") == 3,
+            repr(segments),
+        )
+    above = post(client, {"peaks": payload["peaks"], "charges": [3], "tolerance": "0.0000004"})
+    below = post(client, {"peaks": payload["peaks"], "charges": [3], "tolerance": "0.0000003"})
+    check(
+        "fraction: deconvolve agrees on both sides of 1/3000000",
+        above.status_code == 200
+        and above.json().get("verdict") == "UNIQUE"
+        and below.status_code == 200
+        and below.json().get("verdict") == "UNRESOLVED",
+        f"above={above.text} below={below.text}",
+    )
+
+
+def scenario_sensitivity_validation(client: httpx.Client) -> None:
+    print("[sensitivity: invalid range/peaks -> 422, never a partial spectrum]")
+    good_peaks = [
+        {"mz": "500.000000", "intensity": 100},
+        {"mz": "501.003355", "intensity": 90},
+    ]
+    good_range = {"lower": "0.0001", "upper": "0.01"}
+    cases = {
+        "lower above upper": (
+            {"peaks": good_peaks, "charges": [1], "tolerance_range": {"lower": "0.01", "upper": "0.001"}},
+            "tolerance_range",
+        ),
+        "negative lower": (
+            {"peaks": good_peaks, "charges": [1], "tolerance_range": {"lower": "-0.1", "upper": "0.1"}},
+            "tolerance_range.lower",
+        ),
+        "missing upper": (
+            {"peaks": good_peaks, "charges": [1], "tolerance_range": {"lower": "0.1"}},
+            "tolerance_range.upper",
+        ),
+        "missing range": (
+            {"peaks": good_peaks, "charges": [1]},
+            "tolerance_range",
+        ),
+        "mz not increasing": (
+            {
+                "peaks": [dict(good_peaks[1]), dict(good_peaks[0])],
+                "charges": [1],
+                "tolerance_range": good_range,
+            },
+            "peaks",
+        ),
+        "unknown field": (
+            {"peaks": good_peaks, "charges": [1], "tolerance_range": good_range, "debug": True},
+            "debug",
+        ),
+    }
+    for name, (payload, want_loc) in cases.items():
+        resp = post_sensitivity(client, payload)
+        ok_status = resp.status_code == 422
+        body = resp.json() if ok_status else {}
+        fields = body.get("error", {}).get("fields", [])
+        locs = [f.get("loc", "") for f in fields]
+        located = any(loc == want_loc or loc.startswith(want_loc + ".") for loc in locs)
+        check(
+            f"spectrum validation[{name}]: 422 located at {want_loc}, no partial spectrum",
+            ok_status and located and "segments" not in body,
+            f"status={resp.status_code} locs={locs} body={resp.text[:300]}",
+        )
+
+
+# ---------------------------------------------------------------------- #
 
 
 def main() -> int:
@@ -413,6 +640,11 @@ def main() -> int:
         scenario_cluster_size_cap(client)
         scenario_full_scale(client)
         scenario_validation(client)
+        scan_payload = scenario_sensitivity_boundary_split(client)
+        scenario_sensitivity_determinism(client, scan_payload)
+        scenario_sensitivity_merges_unchanged_verdicts(client)
+        scenario_sensitivity_fractional_boundary(client)
+        scenario_sensitivity_validation(client)
     print(f"\n{_checks - len(_failures)}/{_checks} checks passed")
     if _failures:
         print("FAILED checks:")

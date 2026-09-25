@@ -33,6 +33,7 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/v1/deconvolve` | 解卷积裁决（版本化 JSON 接口） |
+| POST | `/api/v1/deconvolve/sensitivity` | 容差敏感性谱扫描（闭区间） |
 | GET | `/health` | 健康检查 |
 | GET | `/docs` | OpenAPI 交互文档 |
 
@@ -82,6 +83,67 @@ curl -s http://localhost:8000/api/v1/deconvolve \
 }
 ```
 
+## 容差敏感性谱（`/api/v1/deconvolve/sensitivity`）
+
+峰簇复核前，分析员可提交同一组峰与允许电荷，外加一个**闭区间**容差范围
+`tolerance_range = {"lower": …, "upper": …}`（`0 ≤ lower ≤ upper`，均为十进制小数），
+一次性取得该范围内裁决随容差放宽而改变的完整敏感性谱，无需多次手工改值比较。
+
+- **临界容差推导**：峰对 `(i, j)` 在电荷 `z` 下的邻接判定为
+  `|Δmz·z − 1.003355| ≤ tolerance·z`，因此合法峰簇集合只可能在
+  `t = |Δmz·z − 1.003355| / z` 处改变。服务以十进制精度（`Decimal` + 精确有理数）
+  从峰差与允许电荷推导**全部**临界容差；对 `z = 3` 这类产生无限循环小数的临界值
+  （如 `1/3000000`），内部以 `Fraction` 保持精确，响应中以 `"p/q"` 字符串原样返回。
+- **只在端点与临界点重算**：由于邻接判定含等号，裁决在每个半开区间
+  `[t_k, t_{k+1})` 上恒定，因此服务仅在范围下端点与落在 `(lower, upper]` 内的
+  每个临界点处重新执行既有全局解卷积——**不按固定步长采样**，也无跨请求缓存；
+  `evaluation_count == 1 + len(critical_tolerances)` 可直接核验。
+- **分段与合并**：结果按容差递增返回若干段，每段给出 `lower`（恒为含端点）、
+  `upper`、`upper_inclusive`（仅末段为 `true`，对应闭区间上界）以及该段的完整裁决
+  （`verdict`、`objectives`、`clusters`、`unexplained_peaks`、`second_witness`）。
+  相邻段若规范化后的裁决、目标值、峰簇、未解释峰及歧义见证完全相同则合并为一段。
+- **失败语义**：范围或峰数据非法返回 422（`error.fields[].loc` 可定位），不产生
+  部分谱；扫描总工作预算（临界推导 + 各点簇生成 + 全部穷举搜索，由
+  `DECONVOLVER_MAX_SENSITIVITY_OPS` 控制，默认 20,000,000）耗尽时返回 503
+  `SENSITIVITY_SCAN_FAILED` 并说明失败原因，绝不遗漏临界结论、不返回部分谱。
+
+### 请求示例
+
+```bash
+curl -s http://localhost:8000/api/v1/deconvolve/sensitivity \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "peaks": [
+          {"mz": "400.000000", "intensity": 5},
+          {"mz": "401.003855", "intensity": 7}
+        ],
+        "charges": [1],
+        "tolerance_range": {"lower": "0.0001", "upper": "0.001"}
+      }'
+```
+
+### 响应示例
+
+```json
+{
+  "segments": [
+    {"lower": "0.0001", "upper": "0.0005", "upper_inclusive": false,
+     "verdict": "UNRESOLVED",
+     "objectives": {"explained_intensity": 0, "explained_peak_count": 0, "cluster_count": 0},
+     "clusters": [], "unexplained_peaks": ["..."], "second_witness": null},
+    {"lower": "0.0005", "upper": "0.001", "upper_inclusive": true,
+     "verdict": "UNIQUE",
+     "objectives": {"explained_intensity": 12, "explained_peak_count": 2, "cluster_count": 1},
+     "clusters": [{"charge": 1, "peak_indices": [0, 1], "explained_intensity": 12, "peaks": ["..."]}],
+     "unexplained_peaks": [], "second_witness": null}
+  ],
+  "critical_tolerances": ["0.0005"],
+  "evaluation_count": 2,
+  "input_summary": {"peak_count": 2, "charges": [1],
+    "tolerance_range": {"lower": "0.0001", "upper": "0.001"}, "isotope_spacing": "1.003355"}
+}
+```
+
 ## 快速开始（Docker）
 
 ```bash
@@ -97,7 +159,8 @@ docker compose run --rm verify
 ```
 
 `verify` 服务对运行中的真实 API 执行全部验收场景（UNIQUE / AMBIGUOUS /
-UNRESOLVED、字典序目标、容差边界、36 峰全量、非法输入 422 等），全部通过时退出码为 0。
+UNRESOLVED、字典序目标、容差边界、36 峰全量、非法输入 422，以及敏感性谱的
+临界点切分、相同裁决合并、非循环小数边界精确性、扫描非法输入等），全部通过时退出码为 0。
 
 ## 本地开发
 
@@ -114,11 +177,12 @@ python verify/verify_acceptance.py           # 对本机实例跑验收（API_BA
 
 ```
 app/
-  main.py     # FastAPI 应用、路由、错误处理
-  schemas.py  # 请求/响应模型（Pydantic 校验）
-  solver.py   # 穷举式精确求解器（Decimal 精确运算）
-tests/        # pytest 单元与接口测试
-verify/       # 一次性真实接口验收脚本（compose 的 verify 服务）
+  main.py        # FastAPI 应用、路由、错误处理
+  schemas.py     # 请求/响应模型（Pydantic 校验）
+  solver.py      # 穷举式精确求解器（Decimal/Fraction 精确运算）
+  sensitivity.py # 容差敏感性谱（临界容差推导 + 分段合并）
+tests/           # pytest 单元与接口测试
+verify/          # 一次性真实接口验收脚本（compose 的 verify 服务）
 Dockerfile
 docker-compose.yml
 ```

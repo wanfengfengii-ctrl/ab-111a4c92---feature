@@ -16,7 +16,18 @@ from .schemas import (
     InputSummaryOut,
     ObjectivesOut,
     PeakOut,
+    SensitivityInputSummaryOut,
+    SensitivityRequest,
+    SensitivityResponse,
+    SensitivitySegmentOut,
     SolutionOut,
+    ToleranceRangeOut,
+)
+from .sensitivity import (
+    SensitivityScanFailedError,
+    SpectrumSegment,
+    format_tolerance,
+    scan_spectrum,
 )
 from .solver import (
     ISOTOPE_SPACING,
@@ -30,6 +41,10 @@ from .solver import (
 # Safety valve for pathological search spaces (see app.solver).  The search
 # remains fully exhaustive below this budget.
 MAX_SEARCH_OPS = int(os.environ.get("DECONVOLVER_MAX_SEARCH_OPS", "20000000"))
+
+# Total work budget for one tolerance sensitivity scan (critical-tolerance
+# derivation plus every recomputed deconvolution along the range).
+MAX_SENSITIVITY_OPS = int(os.environ.get("DECONVOLVER_MAX_SENSITIVITY_OPS", "20000000"))
 
 app = FastAPI(
     title="Isotope Peak Deconvolution Service",
@@ -86,6 +101,23 @@ async def search_space_exception_handler(
     )
 
 
+@app.exception_handler(SensitivityScanFailedError)
+async def sensitivity_scan_exception_handler(
+    request: Request, exc: SensitivityScanFailedError
+) -> JSONResponse:
+    """Budget exhaustion fails the whole scan: never a partial spectrum."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "code": "SENSITIVITY_SCAN_FAILED",
+                "message": str(exc),
+                "fields": [],
+            }
+        },
+    )
+
+
 @app.get("/health", tags=["meta"])
 def health() -> dict:
     return {"status": "ok", "service": "isotope-deconvolver", "version": __version__}
@@ -98,6 +130,7 @@ def root() -> dict:
         "version": __version__,
         "endpoints": {
             "deconvolve": "POST /api/v1/deconvolve",
+            "sensitivity": "POST /api/v1/deconvolve/sensitivity",
             "health": "GET /health",
             "docs": "GET /docs",
         },
@@ -122,6 +155,76 @@ def deconvolve(payload: DeconvolutionRequest) -> DeconvolutionResponse:
         max_search_ops=MAX_SEARCH_OPS,
     ).solve()
     return _build_response(payload, peaks, result)
+
+
+@app.post(
+    "/api/v1/deconvolve/sensitivity",
+    response_model=SensitivityResponse,
+    tags=["v1"],
+    summary="Tolerance sensitivity spectrum of the deconvolution verdict",
+)
+def sensitivity(payload: SensitivityRequest) -> SensitivityResponse:
+    """Scan a closed tolerance range and report where the verdict changes.
+
+    Critical tolerances are derived exactly from the peak differences and
+    allowed charges; the global deconvolution is recomputed only at the
+    range endpoints and those critical points.  Adjacent segments with
+    identical normalised verdicts are merged.
+    """
+    peaks = [
+        Peak(index=i, mz=p.mz, intensity=p.intensity)
+        for i, p in enumerate(payload.peaks)
+    ]
+    charges = sorted(set(payload.charges))
+    spectrum = scan_spectrum(
+        peaks=peaks,
+        charges=charges,
+        lower=payload.tolerance_range.lower,
+        upper=payload.tolerance_range.upper,
+        max_total_ops=MAX_SENSITIVITY_OPS,
+    )
+    segments = [
+        _segment_out(segment, peaks) for segment in spectrum.segments
+    ]
+    return SensitivityResponse(
+        segments=segments,
+        critical_tolerances=[
+            format_tolerance(t) for t in spectrum.critical_tolerances
+        ],
+        evaluation_count=spectrum.evaluation_count,
+        input_summary=SensitivityInputSummaryOut(
+            peak_count=len(peaks),
+            charges=charges,
+            tolerance_range=ToleranceRangeOut(
+                lower=str(payload.tolerance_range.lower),
+                upper=str(payload.tolerance_range.upper),
+            ),
+            isotope_spacing=str(ISOTOPE_SPACING),
+        ),
+    )
+
+
+def _segment_out(segment: SpectrumSegment, peaks: list[Peak]) -> SensitivitySegmentOut:
+    primary = _solution_out(segment.result.primary, peaks)
+    secondary = (
+        _solution_out(segment.result.secondary, peaks)
+        if segment.result.secondary is not None
+        else None
+    )
+    return SensitivitySegmentOut(
+        lower=format_tolerance(segment.lower),
+        upper=format_tolerance(segment.upper),
+        upper_inclusive=segment.upper_inclusive,
+        verdict=segment.result.verdict,
+        objectives=ObjectivesOut(
+            explained_intensity=segment.result.explained_intensity,
+            explained_peak_count=segment.result.explained_peak_count,
+            cluster_count=segment.result.cluster_count,
+        ),
+        clusters=primary.clusters,
+        unexplained_peaks=primary.unexplained_peaks,
+        second_witness=secondary,
+    )
 
 
 def _build_response(

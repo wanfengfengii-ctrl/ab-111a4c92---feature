@@ -14,14 +14,17 @@ mutually disjoint clusters and optimises the objectives lexicographically:
 No greedy nearest-peak or strongest-candidate-first heuristics are used: a
 dynamic program over peak bitmasks explores the complete search space, and
 ties on all three objectives are detected by enumerating a second optimal
-witness.  All arithmetic is done with :class:`decimal.Decimal`, so results
-are exact and reproducible.
+witness.  All arithmetic is exact — :class:`decimal.Decimal` for API
+requests, and :class:`fractions.Fraction` for the tolerance sensitivity
+scan (see :mod:`app.sensitivity`), whose critical tolerances may be
+non-terminating decimals — so results are exact and reproducible.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from fractions import Fraction
 from typing import Iterable, Sequence
 
 #: Exact isotope spacing (mass difference of 13C vs 12C) in Dalton.
@@ -96,7 +99,7 @@ class Deconvolver:
         self,
         peaks: Sequence[Peak],
         charges: Iterable[int],
-        tolerance: Decimal,
+        tolerance: Decimal | Fraction,
         max_search_ops: int = DEFAULT_MAX_SEARCH_OPS,
     ) -> None:
         peaks = tuple(peaks)
@@ -125,6 +128,11 @@ class Deconvolver:
         )
         self._best_memo: dict[int, Objective] = {}
 
+    @property
+    def search_ops(self) -> int:
+        """Cluster-expansion operations consumed so far (budget accounting)."""
+        return self._search_ops
+
     # ------------------------------------------------------------------ #
     # Cluster generation
     # ------------------------------------------------------------------ #
@@ -134,8 +142,17 @@ class Deconvolver:
 
         The spacing test is evaluated exactly: ``|Δmz·z − 1.003355| ≤ tol·z``
         is equivalent to ``|Δmz − 1.003355/z| ≤ tol`` but needs no division.
+        When ``tolerance`` is a :class:`~fractions.Fraction` (a critical
+        tolerance from the sensitivity scan, possibly a non-terminating
+        decimal) the m/z values are promoted to exact fractions as well, so
+        the boundary comparison stays exact.
         """
-        mzs = [p.mz for p in self._peaks]
+        if isinstance(self._tolerance, Fraction):
+            mzs: list = [Fraction(p.mz) for p in self._peaks]
+            spacing = Fraction(ISOTOPE_SPACING)
+        else:
+            mzs = [p.mz for p in self._peaks]
+            spacing = ISOTOPE_SPACING
         intensities = [p.intensity for p in self._peaks]
         n = len(mzs)
         clusters: list[Cluster] = []
@@ -146,7 +163,7 @@ class Deconvolver:
             for i in range(n):
                 for j in range(i + 1, n):
                     delta = mzs[j] - mzs[i]
-                    deviation = delta * charge - ISOTOPE_SPACING
+                    deviation = delta * charge - spacing
                     if deviation > threshold:
                         break  # m/z strictly increasing: later j deviate even more
                     if deviation >= -threshold:

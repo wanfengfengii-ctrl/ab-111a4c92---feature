@@ -1,6 +1,6 @@
 [project]
 name = "isotope-deconvolver"
-version = "1.0.0"
+version = "1.1.0"
 description = "Deterministic deconvolution of overlapping isotope peaks for HRMS review"
 requires-python = ">=3.13"
 

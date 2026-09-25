@@ -7,6 +7,10 @@ services:
     ports:
       # Host port is configurable: API_PORT=9000 docker compose up --build
       - "${API_PORT:-8000}:8000"
+    environment:
+      # Optional search-budget overrides (safe defaults otherwise).
+      DECONVOLVER_MAX_SEARCH_OPS: "${DECONVOLVER_MAX_SEARCH_OPS:-20000000}"
+      DECONVOLVER_MAX_SENSITIVITY_OPS: "${DECONVOLVER_MAX_SENSITIVITY_OPS:-20000000}"
     healthcheck:
       test:
         - CMD

@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 # Strict: JSON floats such as 1.5 or numeric strings must not be accepted
 # where a positive integer is required.
@@ -28,7 +28,9 @@ class PeakInput(BaseModel):
         return value
 
 
-class DeconvolutionRequest(BaseModel):
+class PeaksChargesInput(BaseModel):
+    """Shared base: the peak list and the allowed charge states."""
+
     model_config = ConfigDict(extra="forbid")
 
     peaks: list[PeakInput] = Field(
@@ -40,18 +42,6 @@ class DeconvolutionRequest(BaseModel):
         min_length=1,
         description="Allowed charge states (a set: positive, unique integers).",
     )
-    tolerance: Decimal = Field(
-        description="Non-negative decimal m/z tolerance applied to 1.003355/z."
-    )
-
-    @field_validator("tolerance")
-    @classmethod
-    def _tolerance_valid(cls, value: Decimal) -> Decimal:
-        if not value.is_finite():
-            raise ValueError("tolerance must be a finite decimal number")
-        if value < 0:
-            raise ValueError("tolerance must be greater than or equal to 0")
-        return value
 
     @field_validator("charges")
     @classmethod
@@ -71,6 +61,61 @@ class DeconvolutionRequest(BaseModel):
                     f"peaks[{i - 1}].mz={value[i - 1].mz}"
                 )
         return value
+
+
+class DeconvolutionRequest(PeaksChargesInput):
+    tolerance: Decimal = Field(
+        description="Non-negative decimal m/z tolerance applied to 1.003355/z."
+    )
+
+    @field_validator("tolerance")
+    @classmethod
+    def _tolerance_valid(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("tolerance must be a finite decimal number")
+        if value < 0:
+            raise ValueError("tolerance must be greater than or equal to 0")
+        return value
+
+
+class ToleranceRangeInput(BaseModel):
+    """Closed tolerance interval ``[lower, upper]`` for a sensitivity scan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    lower: Decimal = Field(
+        description="Inclusive lower bound; finite decimal >= 0."
+    )
+    upper: Decimal = Field(
+        description="Inclusive upper bound; finite decimal >= 0."
+    )
+
+    @field_validator("lower", "upper")
+    @classmethod
+    def _bound_valid(cls, value: Decimal, info: ValidationInfo) -> Decimal:
+        if not value.is_finite():
+            raise ValueError(f"{info.field_name} must be a finite decimal number")
+        if value < 0:
+            raise ValueError(f"{info.field_name} must be greater than or equal to 0")
+        return value
+
+    @model_validator(mode="after")
+    def _range_ordered(self) -> "ToleranceRangeInput":
+        if self.lower > self.upper:
+            raise ValueError(
+                f"lower ({self.lower}) must not exceed upper ({self.upper})"
+            )
+        return self
+
+
+class SensitivityRequest(PeaksChargesInput):
+    tolerance_range: ToleranceRangeInput = Field(
+        description=(
+            "Closed tolerance interval to scan; the verdict spectrum is "
+            "recomputed at its endpoints and at every critical tolerance "
+            "derived from the peak differences inside it."
+        )
+    )
 
 
 # ---------------------------------------------------------------------- #
@@ -116,3 +161,68 @@ class DeconvolutionResponse(BaseModel):
     unexplained_peaks: list[PeakOut]
     second_witness: SolutionOut | None
     input_summary: InputSummaryOut
+
+
+# ---------------------------------------------------------------------- #
+# Sensitivity spectrum
+# ---------------------------------------------------------------------- #
+
+
+class SensitivitySegmentOut(BaseModel):
+    """One tolerance interval on which the normalised verdict is constant."""
+
+    lower: str = Field(
+        description=(
+            "Inclusive lower boundary; exact decimal string, or 'p/q' when "
+            "the critical tolerance is a non-terminating decimal."
+        )
+    )
+    upper: str = Field(description="Upper boundary; same exact format as lower.")
+    upper_inclusive: bool = Field(
+        description=(
+            "Whether the upper boundary belongs to this segment. Only the "
+            "final segment (ending at the closed range end) is inclusive."
+        )
+    )
+    verdict: Literal["UNIQUE", "AMBIGUOUS", "UNRESOLVED"]
+    objectives: ObjectivesOut
+    clusters: list[ClusterOut]
+    unexplained_peaks: list[PeakOut]
+    second_witness: SolutionOut | None
+
+
+class ToleranceRangeOut(BaseModel):
+    lower: str
+    upper: str
+
+
+class SensitivityInputSummaryOut(BaseModel):
+    peak_count: int
+    charges: list[int]
+    tolerance_range: ToleranceRangeOut
+    isotope_spacing: str
+
+
+class SensitivityResponse(BaseModel):
+    segments: list[SensitivitySegmentOut] = Field(
+        description=(
+            "Verdict-constant tolerance intervals, sorted by increasing "
+            "tolerance; adjacent intervals with identical normalised "
+            "verdicts are merged."
+        )
+    )
+    critical_tolerances: list[str] = Field(
+        description=(
+            "Every critical tolerance inside the scanned range (i.e. in "
+            "(lower, upper]) at which the legal cluster set changes; each "
+            "triggered a recomputation of the global deconvolution."
+        )
+    )
+    evaluation_count: int = Field(
+        description=(
+            "Number of full deconvolutions recomputed: the range's lower "
+            "endpoint plus one per in-range critical tolerance (never a "
+            "fixed-step sample)."
+        )
+    )
+    input_summary: SensitivityInputSummaryOut
