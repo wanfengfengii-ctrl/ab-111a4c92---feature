@@ -1,0 +1,35 @@
+name: isotope-deconvolver
+
+services:
+  api:
+    build: .
+    image: isotope-deconvolver:latest
+    ports:
+      # Host port is configurable: API_PORT=9000 docker compose up --build
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).getcode() == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot acceptance suite against the real API.
+  #   docker compose run --rm verify
+  # or:
+  #   docker compose --profile verify up --abort-on-container-exit
+  verify:
+    image: isotope-deconvolver:latest
+    build: .
+    profiles: ["verify"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: "http://api:8000"
+    command: ["python", "verify/verify_acceptance.py"]
